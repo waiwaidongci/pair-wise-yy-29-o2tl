@@ -1,5 +1,42 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+section{margin:16px 0;padding:12px 16px;border:1px solid #ddd;border-radius:8px}
+h2{font-size:20px}h3{font-size:16px;margin:8px 0}
+ul{margin:4px 0;padding-left:20px}
+</style>
+<h1>数字凭证签发与验证</h1>
+<p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。预约撤销在生效前不影响原证核验，预约期间同模板不再另发，生效时刻到达后原证按撤销处理。</p>
+<button onclick="loadState()">刷新状态</button>
+<section>
+<h2>预约撤销台</h2>
+<h3>待生效</h3><ul id="pending"></ul>
+<h3>已生效</h3><ul id="effective"></ul>
+<h3>已取消</h3><ul id="cancelled"></ul>
+</section>
+<h2>完整状态</h2><pre id="state">加载中...</pre>
+<script>
+function describe(r){
+  let text=`#${r.id}｜凭证 ${r.credential_id}｜原因：${r.reason}｜生效时刻：${r.effective_at}｜登记：${r.issuer} @ ${r.created_at}`;
+  if(r.cancelled_by)text+=`｜取消：${r.cancelled_by} @ ${r.cancelled_at}`;
+  return text;
+}
+function render(id,records){
+  const ul=document.getElementById(id);
+  ul.textContent="";
+  if(!records.length){const li=document.createElement("li");li.textContent="（暂无记录）";ul.appendChild(li);return}
+  for(const r of records){const li=document.createElement("li");li.textContent=describe(r);ul.appendChild(li)}
+}
+async function loadState(){
+  const data=await (await fetch('/api/state')).json();
+  document.getElementById('state').textContent=JSON.stringify(data,null,2);
+  const groups=data.revocation_schedules||{pending:[],effective:[],cancelled:[]};
+  render('pending',groups.pending);
+  render('effective',groups.effective);
+  render('cancelled',groups.cancelled);
+}
+loadState()
+</script>
 </html>

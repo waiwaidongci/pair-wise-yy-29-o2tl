@@ -17,6 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from revocation_intake import RevocationError, RevocationIntake
+from revocation_store import RevocationStore
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -117,6 +120,7 @@ class Store:
             );
             """
         )
+        RevocationStore(self.conn).init_schema()
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -135,6 +139,7 @@ class CredentialService:
     def __init__(self, store: Store):
         self.store = store
         self.conn = store.conn
+        self.revocations = RevocationIntake(RevocationStore(store.conn), store.conn, store.audit)
 
     @staticmethod
     def _required_actor(actor: str | None, role: str | None, expected: str) -> str:
@@ -216,6 +221,9 @@ class CredentialService:
         ).fetchone()
         if existing:
             return self._credential_dict(existing)
+        self.revocations.sweep_due()
+        if self.revocations.pending_for_template_holder(template_id, holder_id):
+            raise ApiError(409, "该持有人的同模板凭证已预约撤销，预约期间不再另发")
         fields = json.loads(template["fields_json"])
         missing = [f["name"] for f in fields if f["required"] and not str(claims.get(f["name"], "")).strip()]
         unknown = sorted(set(claims) - {f["name"] for f in fields})
@@ -264,6 +272,7 @@ class CredentialService:
 
     def dispute(self, actor: str | None, role: str | None, credential_id: int, reason: str) -> dict:
         actor = self._required_actor(actor, role, "holder")
+        self.revocations.sweep_due()
         credential = self._row("credentials", credential_id)
         if credential["holder_id"] != actor:
             raise ApiError(403, "只能对自己的凭证提出争议")
@@ -296,6 +305,8 @@ class CredentialService:
         with self.conn:
             self.conn.execute("UPDATE disputes SET status=?,resolution=?,resolved_at=? WHERE id=?", (dispute_status, resolution, iso(), dispute_id))
             self.conn.execute("UPDATE credentials SET status=? WHERE id=?", (new_status, credential["id"]))
+            if decision == "reject":
+                self.revocations.overturn(credential["id"], actor)
             self.store.audit(actor, "dispute.resolve", "dispute", dispute_id, {"decision": decision, "credential_status": new_status})
         return {"id": dispute_id, "status": decision, "credential_status": new_status, "resolution": resolution}
 
@@ -339,6 +350,7 @@ class CredentialService:
             supplied_signature = envelope["signature"]
         except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ApiError(400, "凭证令牌格式错误") from exc
+        self.revocations.sweep_due()
         credential = self._row("credentials", int(payload.get("credential_id", 0)))
         key = self.conn.execute(
             "SELECT * FROM key_versions WHERE issuer=? AND version=?", (credential["issuer"], credential["key_version"])
@@ -361,6 +373,13 @@ class CredentialService:
                 result.update(valid=False, status="revoked", reason=credential["revocation_reason"])
             else:
                 result.update(status="valid_until_revocation", revocation_starts_at=credential["revocation_effective_at"])
+        if result["valid"]:
+            schedule = self.revocations.schedule_for_credential(credential["id"])
+            if schedule:
+                if check_at >= parse_time(schedule["effective_at"]):
+                    result.update(valid=False, status="revoked", reason=schedule["reason"])
+                else:
+                    result["scheduled_revocation_at"] = schedule["effective_at"]
         if not online:
             result["offline"] = True
             result["revocation_freshness"] = "needs_online_check"
@@ -378,10 +397,11 @@ class CredentialService:
         }
 
     def state(self) -> dict:
+        revocations = self.revocations.overview()
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
         templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
-        return {"templates": templates, "credentials": credentials, "audits": audits}
+        return {"templates": templates, "credentials": credentials, "revocation_schedules": revocations, "audits": audits}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM key_versions LIMIT 1").fetchone():
@@ -423,6 +443,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
                 return self._json(200, self.service.state())
+            if parts == ["api", "revocation-schedules"]:
+                return self._json(200, self.service.revocations.overview())
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -432,7 +454,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(page)
                 return
             raise ApiError(404, "接口不存在")
-        except ApiError as exc:
+        except (ApiError, RevocationError) as exc:
             self._json(exc.status, {"error": exc.message})
         except Exception as exc:
             self._json(500, {"error": str(exc)})
@@ -450,6 +472,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.issue(actor, role, int(body.get("template_id", 0)), body.get("holder_id", ""), body.get("claims", {}), body.get("idempotency_key", ""), body.get("valid_until"))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revoke":
                 result = self.service.revoke(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
+            elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revocation-schedule":
+                result = self.service.revocations.schedule(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
+            elif len(parts) == 4 and parts[:2] == ["api", "revocation-schedules"] and parts[3] == "cancel":
+                result = self.service.revocations.cancel(actor, role, int(parts[2]))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "dispute":
                 result = self.service.dispute(actor, role, int(parts[2]), body.get("reason", ""))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "present":
@@ -461,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 raise ApiError(404, "接口不存在")
             self._json(200, result)
-        except ApiError as exc:
+        except (ApiError, RevocationError) as exc:
             self._json(exc.status, {"error": exc.message})
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc:
             self._json(400, {"error": str(exc)})
