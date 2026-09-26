@@ -12,37 +12,20 @@ import secrets
 import sqlite3
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from revocation_desk import RevocationDesk
+from revocation_repository import RevocationRepository
+from revocation_status import ApiError, iso, now, parse_time, verify_effect
+
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or now()).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        return now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
 
 
 class Store:
@@ -52,6 +35,7 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.revocations = RevocationRepository(self.conn)
         self.init_schema()
 
     def init_schema(self) -> None:
@@ -117,6 +101,7 @@ class Store:
             );
             """
         )
+        self.revocations.init_schema()
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -135,6 +120,7 @@ class CredentialService:
     def __init__(self, store: Store):
         self.store = store
         self.conn = store.conn
+        self.desk = RevocationDesk(store)
 
     @staticmethod
     def _required_actor(actor: str | None, role: str | None, expected: str) -> str:
@@ -221,6 +207,8 @@ class CredentialService:
         unknown = sorted(set(claims) - {f["name"] for f in fields})
         if missing or unknown:
             raise ApiError(400, f"声明不完整，缺少={missing}，未知字段={unknown}")
+        if self.store.revocations.find_pending_for_template_holder(template_id, holder_id):
+            raise ApiError(409, "该持有人同模板凭证已预约撤销，生效前不再另发")
         live = self.conn.execute(
             "SELECT id FROM credentials WHERE template_id=? AND holder_id=? AND status IN ('active','disputed')",
             (template_id, holder_id),
@@ -339,6 +327,7 @@ class CredentialService:
             supplied_signature = envelope["signature"]
         except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ApiError(400, "凭证令牌格式错误") from exc
+        self.desk.apply_due()
         credential = self._row("credentials", int(payload.get("credential_id", 0)))
         key = self.conn.execute(
             "SELECT * FROM key_versions WHERE issuer=? AND version=?", (credential["issuer"], credential["key_version"])
@@ -361,6 +350,10 @@ class CredentialService:
                 result.update(valid=False, status="revoked", reason=credential["revocation_reason"])
             else:
                 result.update(status="valid_until_revocation", revocation_starts_at=credential["revocation_effective_at"])
+        if result["valid"] and credential["status"] == "active":
+            pending = self.store.revocations.find_pending_for_credential(credential["id"])
+            if pending:
+                result.update(verify_effect(pending, check_at))
         if not online:
             result["offline"] = True
             result["revocation_freshness"] = "needs_online_check"
@@ -381,7 +374,7 @@ class CredentialService:
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
         templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
-        return {"templates": templates, "credentials": credentials, "audits": audits}
+        return {"templates": templates, "credentials": credentials, "audits": audits, "revocations": self.desk.list_grouped()}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM key_versions LIMIT 1").fetchone():
@@ -423,6 +416,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
                 return self._json(200, self.service.state())
+            if parts == ["api", "revocation-schedules"]:
+                return self._json(200, self.service.desk.list_grouped())
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -454,6 +449,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.dispute(actor, role, int(parts[2]), body.get("reason", ""))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "present":
                 result = self.service.present(actor, role, int(parts[2]), body.get("disclosed_fields"))
+            elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revocation-schedules":
+                result = self.service.desk.schedule(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"), body.get("idempotency_key", ""))
+            elif len(parts) == 4 and parts[:2] == ["api", "revocation-schedules"] and parts[3] == "cancel":
+                result = self.service.desk.cancel(actor, role, int(parts[2]))
             elif len(parts) == 4 and parts[:2] == ["api", "disputes"] and parts[3] == "resolve":
                 result = self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
             elif parts == ["api", "verify"]:

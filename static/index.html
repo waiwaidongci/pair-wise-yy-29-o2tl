@@ -1,5 +1,20 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}section{margin-bottom:8px}</style>
+<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。预约撤销登记原因与生效时刻，预约期间原证照常可用、同模板不再另发，到点后原证按撤销处理。</p><button onclick="loadState()">刷新状态</button>
+<h2>预约撤销</h2>
+<section><h3>待生效</h3><pre id="pending">加载中...</pre></section>
+<section><h3>已生效</h3><pre id="effective">加载中...</pre></section>
+<section><h3>已取消</h3><pre id="cancelled">加载中...</pre></section>
+<h2>整体状态</h2><pre id="state">加载中...</pre>
+<script>
+async function loadState(){
+  const data=await (await fetch('/api/state')).json();
+  const rev=data.revocations||{pending:[],effective:[],cancelled:[]};
+  for(const key of ['pending','effective','cancelled']){
+    document.getElementById(key).textContent=rev[key].length?JSON.stringify(rev[key],null,2):'（无）';
+  }
+  document.getElementById('state').textContent=JSON.stringify(data,null,2);
+}
+loadState()
+</script>
 </html>

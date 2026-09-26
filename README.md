@@ -19,8 +19,13 @@ python3 app.py
 - `POST /api/credentials/{id}/present`：按持有人选择披露字段并生成令牌。
 - `POST /api/verify`：验证令牌，可指定验证时间与在线/离线模式。
 - `POST /api/credentials/{id}/revoke`：签发方撤销凭证。
+- `POST /api/credentials/{id}/revocation-schedules`：预约撤销，登记原因与生效时刻；预约期间原证照常核验、同模板不再另发，相同幂等键重复提交沿用首次结果。
+- `POST /api/revocation-schedules/{id}/cancel`：取消预约，记录取消人与取消时间；仅待生效的预约可取消。
+- `GET /api/revocation-schedules`：按待生效、已生效、已取消分组列出预约记录（`GET /api/state` 的 `revocations` 字段相同）。
 - `POST /api/credentials/{id}/dispute`、`POST /api/disputes/{id}/resolve`：提出和处理撤销争议。
 - `GET /api/state`、`GET /api/health`：查看状态和健康检查。
+
+预约撤销台分为三个业务文件：`revocation_desk.py`（预约受理）、`revocation_status.py`（状态判断）、`revocation_repository.py`（保存）。到点的预约在核验、取消或查询时即时应用，原证按撤销处理。
 
 ## 测试
 
